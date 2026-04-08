@@ -47,6 +47,12 @@ func New(port int, mgr *printer.Manager) *Server {
 		return printData(mgr, ctx, "")
 	})
 
+	app.Post("/p/:printerId/print/label", func(ctx fiber.Ctx) error {
+		printerId := ctx.Params("printerId")
+		logger.Debugf("Label print request received for printer: %s", printerId)
+		return printLabel(mgr, ctx, printerId)
+	})
+
 	server := &Server{app: app, Port: port}
 	server.running.Store(true)
 	go func() {
@@ -91,6 +97,50 @@ func printData(mgr *printer.Manager, ctx fiber.Ctx, printerID string) error {
 	}
 	logger.Debugf("Print job completed successfully for printer: %s", printerID)
 	return ctx.XML(EPOSResponse{Success: true, Code: "", Status: ""})
+}
+
+func printLabel(mgr *printer.Manager, ctx fiber.Ctx, printerID string) error {
+    logger.Debugf("Processing label print job for printer: %s", printerID)
+
+    jobData := ctx.Body()
+    
+    if len(jobData) == 0 {
+        logger.Warn("Empty label data received")
+        return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+            "success": false,
+            "error": "Empty data",
+        })
+    }
+
+    reply, err := mgr.WriteAsync(printerID, jobData)
+    if err == nil {
+        logger.Debug("Label print job queued")
+        result := <-reply
+        if !result.OK {
+            err = result.Err
+        }
+    }
+    
+    if err != nil {
+		status := fiber.StatusInternalServerError
+		retCode := ""
+		if errors.Is(err, printer.ErrQueueFull) {
+			retCode = "TooManyRequests"
+			logger.Warn("Printer queue full")
+		} else {
+			retCode = "EX_BADPORT"
+		}
+		logger.Errorf("Print error [%s]: %v, Printer ID: %s", retCode, err, printerID)
+		return ctx.Status(status).JSON(fiber.Map{
+            "success": false,
+            "error": retCode,
+        })
+	}
+	logger.Debugf("Print job completed successfully for printer: %s", printerID)
+	return ctx.JSON(fiber.Map{
+        "success": true,
+		"message":   "Label sent to printer",
+    })
 }
 
 func (s *Server) Stop() error {
