@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,8 @@ type Printer struct {
 	// LAN fields
 	tcpConn net.Conn
 	jobs    chan job
+	// Backend for OS-claimed printers (CUPS/WinSpooler)
+	backend PrintBackend
 }
 
 func newPrinter(id string) *Printer {
@@ -68,7 +71,21 @@ func newPrinter(id string) *Printer {
 		return p
 	}
 
-	// USB printer
+	// Check if this is an OS-managed printer (CUPS/WinSpooler)
+	if backend, info, ok := getOSBackendForID(id); ok {
+		p := &Printer{
+			printerType: PrinterTypeUSB, // Keep USB type for compatibility
+			id:          nil,
+			backend:     backend,
+			jobs:        make(chan job, QueueSize),
+		}
+		logger.Debugf("Created OS-managed printer instance for %s (backend: %s)", 
+			info.Name, info.BackendType)
+		go p.loop()
+		return p
+	}
+
+	// USB printer (raw/direct)
 	var printerID *PrinterID = nil
 	if id != "" {
 		printerID, _ = decodePrinterID(id)
@@ -80,9 +97,51 @@ func newPrinter(id string) *Printer {
 		jobs:        make(chan job, QueueSize),
 	}
 
-	logger.Debugf("Created new LAN printer instance for IP: %s", p.idToString())
+	logger.Debugf("Created new USB printer instance for ID: %s", p.idToString())
 	go p.loop()
 	return p
+}
+
+// getOSBackendForID checks if a printer ID corresponds to an OS-managed printer
+// and returns the appropriate backend
+func getOSBackendForID(id string) (PrintBackend, UnifiedPrinterInfo, bool) {
+	// Check for OS printer ID prefix
+	if !strings.HasPrefix(id, "os:") {
+		return nil, UnifiedPrinterInfo{}, false
+	}
+
+	// Parse OS printer ID: os:<backend>:<name>
+	parts := strings.SplitN(id, ":", 3)
+	if len(parts) != 3 {
+		return nil, UnifiedPrinterInfo{}, false
+	}
+
+	backendType := parts[1]
+	printerName := parts[2]
+
+	switch backendType {
+	case "cups":
+		info := UnifiedPrinterInfo{
+			ID:          id,
+			Name:        printerName,
+			BackendType: BackendCUPS,
+			IsOSClaimed: true,
+			Online:      true,
+		}
+		return newCUPSBackend(printerName, info), info, true
+
+	case "winspool":
+		info := UnifiedPrinterInfo{
+			ID:          id,
+			Name:        printerName,
+			BackendType: BackendWinSpooler,
+			IsOSClaimed: true,
+			Online:      true,
+		}
+		return newWinSpoolBackend(printerName, info), info, true
+	}
+
+	return nil, UnifiedPrinterInfo{}, false
 }
 
 func (p *Printer) Enqueue(fn JobFunc, reply chan JobResult) error {
@@ -98,6 +157,16 @@ func (p *Printer) Enqueue(fn JobFunc, reply chan JobResult) error {
 }
 
 func (p *Printer) Write(data []byte) error {
+	// Use backend if available (OS-claimed printers)
+	if p.backend != nil {
+		logger.Debugf("Using OS backend to write %d bytes to printer %s", len(data), p.idToString())
+		if err := p.backend.Print(data); err != nil {
+			return fmt.Errorf("backend print failed for %s: %w", p.idToString(), err)
+		}
+		return nil
+	}
+
+	// Otherwise use direct USB/LAN
 	if err := p.ensureOpen(); err != nil {
 		return err
 	}
@@ -285,6 +354,14 @@ func (p *Printer) close() {
 }
 
 func (p *Printer) closeDeviceLocked() {
+	// Close backend if using OS-managed printer
+	if p.backend != nil {
+		_ = p.backend.Close()
+		p.backend = nil
+		logger.Debugf("OS-managed printer %s backend closed", p.idToString())
+		return
+	}
+
 	if p.printerType == PrinterTypeLAN {
 		if p.tcpConn != nil {
 			_ = p.tcpConn.Close()

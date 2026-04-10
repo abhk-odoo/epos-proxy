@@ -73,13 +73,15 @@ func (a *App) shutdown(ctx context.Context) {
 }
 
 type Printer struct {
-	Name   string `json:"name"`
-	Serial string `json:"serial"`
-	Ip     string `json:"ip"`
-	Id     string `json:"id"`
-	IsLAN  bool   `json:"isLAN"`
-	LANIp  string `json:"lanIp,omitempty"`
-	Online bool   `json:"online"`
+	Name        string `json:"name"`
+	Serial      string `json:"serial"`
+	Ip          string `json:"ip"`
+	Id          string `json:"id"`
+	IsLAN       bool   `json:"isLAN"`
+	LANIp       string `json:"lanIp,omitempty"`
+	Online      bool   `json:"online"`
+	BackendType string `json:"backendType,omitempty"` // cups, winspool, libusb, tcp
+	IsOSClaimed bool   `json:"isOSClaimed,omitempty"` // true if routed via OS spooler
 }
 
 type UnavailablePrinter struct {
@@ -105,8 +107,94 @@ func (a *App) GetPrinterIp(id string) string {
 }
 
 func (a *App) Status() Status {
+	logger.Debug("Collecting printer status with unified detection")
 
-	logger.Debug("Collecting printer status")
+	printers := make([]Printer, 0)
+	unavailablePrinters := make([]UnavailablePrinter, 0)
+
+	// Use unified detector for USB + OS printer detection
+	detector := printer.NewDetector()
+	unified, unavailable, err := detector.Detect()
+	
+	errorMsg := ""
+	if err != nil {
+		errorMsg = err.Error()
+		logger.Errorf("Unified printer detection failed: %v", err)
+		// Fall back to legacy detection
+		return a.legacyStatus()
+	}
+
+	// Convert unified printer info to UI format
+	for _, info := range unified {
+		printerEntry := Printer{
+			Id:          info.ID,
+			Name:        info.Name,
+			Ip:          a.GetPrinterIp(info.ID),
+			IsLAN:       info.IsLAN,
+			LANIp:       info.LANIP,
+			Online:      info.Online,
+			BackendType: info.BackendType.String(),
+			IsOSClaimed: info.IsOSClaimed,
+		}
+		
+		// Extract serial from ID for display
+		if decoded, ok := printer.DecodeLANPrinterID(info.ID); ok {
+			// It's a LAN printer, IP is the identifier
+			printerEntry.LANIp = decoded
+		}
+		
+		printers = append(printers, printerEntry)
+		logger.Debugf("Added unified printer: %s (backend: %s, osClaimed: %v)", 
+			info.Name, info.BackendType, info.IsOSClaimed)
+	}
+
+	// Add unavailable printers
+	for _, unavail := range unavailable {
+		unavailablePrinters = append(unavailablePrinters, UnavailablePrinter{
+			Name:     unavail.Name,
+			ErrorMsg: unavail.Error,
+			IsLAN:    false,
+		})
+	}
+
+	// Add LAN printers (they're handled separately)
+	lanPrinters := printer.ListLANPrinters(a.config)
+	for _, info := range lanPrinters {
+		// Check if this LAN printer is already in the list
+		found := false
+		for _, p := range printers {
+			if p.Id == info.Id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			printers = append(printers, Printer{
+				Id:          info.Id,
+				Name:        fmt.Sprintf("Network - %s", info.IP),
+				Ip:          a.GetPrinterIp(info.Id),
+				IsLAN:       true,
+				LANIp:       info.IP,
+				Online:      true,
+				BackendType: "tcp",
+				IsOSClaimed: false,
+			})
+		}
+	}
+
+	return Status{
+		ServerRunning:       a.webserver.Running(),
+		DefaultIp:           fmt.Sprintf("127.0.0.1:%d", a.webserver.Port),
+		Printers:            printers,
+		UnavailablePrinters: unavailablePrinters,
+		ErrorMsg:            errorMsg,
+		Os:                  runtime.GOOS,
+	}
+}
+
+// legacyStatus uses the original detection method as fallback
+func (a *App) legacyStatus() Status {
+	logger.Debug("Using legacy printer detection (fallback)")
 
 	printers := make([]Printer, 0)
 	unavailablePrinters := make([]UnavailablePrinter, 0)
@@ -115,16 +203,17 @@ func (a *App) Status() Status {
 	errorMsg := ""
 
 	if err == nil {
-
 		logger.Debugf("Detected %d available USB printers", len(printerInfos.Available))
 
 		for _, info := range printerInfos.Available {
 			printers = append(printers, Printer{
-				Id:     info.Id,
-				Name:   info.VendorName + " " + info.ProductName,
-				Serial: info.Serial,
-				Ip:     a.GetPrinterIp(info.Id),
-				Online: true,
+				Id:          info.Id,
+				Name:        info.VendorName + " " + info.ProductName,
+				Serial:      info.Serial,
+				Ip:          a.GetPrinterIp(info.Id),
+				Online:      true,
+				BackendType: "libusb",
+				IsOSClaimed: false,
 			})
 		}
 
@@ -133,7 +222,6 @@ func (a *App) Status() Status {
 				Name:     info.Name,
 				ErrorMsg: info.Error,
 			})
-
 			logger.Warnf("USB printer unavailable: %s (%s)", info.Name, info.Error)
 		}
 	} else {
@@ -142,14 +230,15 @@ func (a *App) Status() Status {
 	}
 
 	lanPrinters := printer.ListLANPrinters(a.config)
-
 	for _, info := range lanPrinters {
 		printers = append(printers, Printer{
-			Id:    info.Id,
-			Name:  fmt.Sprintf("Network - %s", info.IP),
-			Ip:    a.GetPrinterIp(info.Id),
-			IsLAN: true,
-			LANIp: info.IP,
+			Id:          info.Id,
+			Name:        fmt.Sprintf("Network - %s", info.IP),
+			Ip:          a.GetPrinterIp(info.Id),
+			IsLAN:       true,
+			LANIp:       info.IP,
+			Online:      true,
+			BackendType: "tcp",
 		})
 	}
 
