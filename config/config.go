@@ -20,6 +20,7 @@ const (
 type AppConfig struct {
 	Port        int      `json:"port"`
 	LANPrinters []string `json:"lan_printers,omitempty"`
+	FirewallPorts   []int    `json:"firewall_ports,omitempty"`
 }
 
 func defaults() AppConfig {
@@ -89,7 +90,7 @@ func (cm *Manager) saveLocked() error {
 func (cm *Manager) Path() string { return cm.path }
 
 func isPortAvailable(port int) bool {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return false
 	}
@@ -171,4 +172,29 @@ func (cm *Manager) GetLANPrinters() []string {
 	result := make([]string, len(cm.Data.LANPrinters))
 	copy(result, cm.Data.LANPrinters)
 	return result
+}
+
+func (cm *Manager) IsFirewallPortConfigured(port int) bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	for _, p := range cm.Data.FirewallPorts {
+		if p == port {
+			return true
+		}
+	}
+	return false
+}
+
+func (cm *Manager) AddFirewallPort(port int) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	for _, p := range cm.Data.FirewallPorts {
+		if p == port {
+			return nil // Already exists
+		}
+	}
+	cm.Data.FirewallPorts = append(cm.Data.FirewallPorts, port)
+	return cm.saveLocked()
 }

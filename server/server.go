@@ -21,10 +21,21 @@ type EPOSResponse struct {
 	Status  string   `xml:"status,attr"`
 }
 
+type KioskRequest struct {
+	Command string `json:"command"` // "open" or "close"
+	URL     string `json:"url"`     // required for "open" command
+}
+
+type KioskCallbacks struct {
+	OpenKiosk  func(url string) error
+	CloseKiosk func() error
+}
+
 type Server struct {
-	app     *fiber.App
-	Port    int
-	running atomic.Bool
+	app            *fiber.App
+	Port           int
+	running        atomic.Bool
+	kioskCallbacks *KioskCallbacks
 }
 
 func New(port int, mgr *printer.Manager) *Server {
@@ -48,6 +59,11 @@ func New(port int, mgr *printer.Manager) *Server {
 	})
 
 	server := &Server{app: app, Port: port}
+
+	app.Post("/kiosk", func(ctx fiber.Ctx) error {
+		println("Kiosk endpoint - handles both open and close commands")
+		return server.handleKiosk(ctx)
+	})
 	server.running.Store(true)
 	go func() {
 		logger.Infof("HTTP server listening on 0.0.0.0:%d", port)
@@ -100,4 +116,73 @@ func (s *Server) Stop() error {
 
 func (s *Server) Running() bool {
 	return s.running.Load()
+}
+
+func (s *Server) SetKioskCallbacks(callbacks *KioskCallbacks) {
+	s.kioskCallbacks = callbacks
+}
+
+func (s *Server) handleKiosk(ctx fiber.Ctx) error {
+	var req KioskRequest
+	if err := ctx.Bind().JSON(&req); err != nil {
+		logger.Warnf("Invalid kiosk request: %v", err)
+		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid request body",
+		})
+	}
+
+	switch req.Command {
+	case "open":
+		if req.URL == "" {
+			logger.Warn("Kiosk open request missing URL")
+			return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   "URL is required for open command",
+			})
+		}
+		logger.Infof("Opening kiosk with URL: %s", req.URL)
+
+		if s.kioskCallbacks != nil && s.kioskCallbacks.OpenKiosk != nil {
+			if err := s.kioskCallbacks.OpenKiosk(req.URL); err != nil {
+				logger.Errorf("Failed to open kiosk: %v", err)
+				return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"success": false,
+					"error":   err.Error(),
+				})
+			}
+		}
+
+		logger.Infof("Kiosk opened successfully")
+		return ctx.JSON(fiber.Map{
+			"success": true,
+			"message": "Kiosk opened",
+		})
+
+	case "close":
+		logger.Infof("Closing kiosk")
+
+		if s.kioskCallbacks != nil && s.kioskCallbacks.CloseKiosk != nil {
+			if err := s.kioskCallbacks.CloseKiosk(); err != nil {
+				logger.Errorf("Failed to close kiosk: %v", err)
+				return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"success": false,
+					"error":   err.Error(),
+				})
+			}
+		}
+
+		logger.Infof("Kiosk closed successfully")
+		return ctx.JSON(fiber.Map{
+			"success": true,
+			"message": "Kiosk closed",
+		})
+
+	default:
+		logger.Warnf("Invalid kiosk command: %s", req.Command)
+		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid command. Use 'open' or 'close'",
+		})
+	}
 }

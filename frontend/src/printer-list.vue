@@ -1,5 +1,22 @@
 <template>
   <div>
+    <div class="fixed top-4 right-4 z-50 flex items-center gap-3 bg-white px-4 py-2 rounded-full border border-gray-200">
+      <span class="text-sm text-gray-500 whitespace-nowrap">
+        Proxy IP
+      </span>
+      <span
+        class="text-sm font-mono text-gray-800 truncate max-w-[200px]"
+        :title="networkIp"
+      >
+        {{ networkIp || 'Loading...' }}
+      </span>
+      <button 
+        @click="copyNetworkIp"
+        class="ml-1 px-3 py-1 rounded-full bg-odoo text-white hover:bg-odoo-dark transition text-sm"
+      >
+        {{ copiedNetwork ? '✓' : 'Copy' }}
+      </button>
+    </div>
     <div
         class="w-full max-w-full sm:max-w-md md:max-w-lg lg:max-w-xl bg-white/85 rounded-2xl shadow-lg overflow-hidden px-4 sm:px-6 py-2 sm:py-4">
 
@@ -109,6 +126,8 @@ import {brewSteps, linuxSteps, zadigSteps} from "./modal/fix-step";
 import StepModal from "./modal/step-modal.vue";
 import NetworkIpDialog from "./modal/network-ip-dialog.vue";
 
+const networkIp = ref('')
+const copiedNetwork = ref(false)
 const printers = ref([])
 const unavailablePrinters = ref([])
 const errorMsg = ref(null)
@@ -139,6 +158,7 @@ function updatePrinters() {
   Status().then((res) => {
     printers.value = res.printers
     unavailablePrinters.value = res.unavailablePrinters
+    networkIp.value = res.networkIp || res.defaultIp
     errorMsg.value = res.errorMsg
     os.value = res.os
     loading.value = false
@@ -208,6 +228,17 @@ async function copyPrinterIp(printer) {
     await navigator.clipboard.writeText(printer.ip)
     copiedIds.value[printer.id] = true
     setTimeout(() => copiedIds.value[printer.id] = false, 2000)
+  } catch (err) {
+    console.error('Copy failed:', err)
+  }
+}
+
+async function copyNetworkIp() {
+  if (!networkIp.value) return
+  try {
+    await navigator.clipboard.writeText(networkIp.value)
+    copiedNetwork.value = true
+    setTimeout(() => copiedNetwork.value = false, 2000)
   } catch (err) {
     console.error('Copy failed:', err)
   }

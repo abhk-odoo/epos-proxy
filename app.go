@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"epos-proxy/config"
@@ -62,6 +65,14 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	a.webserver = server.New(port, a.printerManager)
+
+	go ensureFirewallPort(port, cfg)
+
+	// Register kiosk callbacks
+	a.webserver.SetKioskCallbacks(&server.KioskCallbacks{
+		OpenKiosk:  a.OpenKiosk,
+		CloseKiosk: a.CloseKiosk,
+	})
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -69,6 +80,62 @@ func (a *App) shutdown(ctx context.Context) {
 
 	if err := a.webserver.Stop(); err != nil {
 		logger.Errorf("Server stop error: %v", err)
+	}
+}
+
+func ensureFirewallPort(port int, cfg *config.Manager) {
+	if cfg.IsFirewallPortConfigured(port) {
+		logger.Infof("Firewall port %d already configured (skipping permission prompt)", port)
+		return
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		out, err := exec.Command("pkexec", "ufw", "status").Output()
+		if err != nil {
+			logger.Warnf("ufw not available: %v", err)
+			return
+		}
+		if !strings.Contains(string(out), "Status: active") {
+			logger.Info("ufw inactive, skipping firewall rule")
+			return
+		}
+		rule := fmt.Sprintf("%d/tcp", port)
+		if strings.Contains(string(out), rule) {
+			logger.Infof("Firewall port %d already open", port)
+			cfg.AddFirewallPort(port)
+			return
+		}
+		if err := exec.Command("pkexec", "ufw", "allow", rule).Run(); err != nil {
+			logger.Warnf("Failed to open ufw port %d: %v", port, err)
+			return
+		}
+		logger.Infof("ufw: port %d opened", port)
+		cfg.AddFirewallPort(port)
+
+	case "windows":
+		ruleName := "ePOS Proxy"
+		rule := fmt.Sprintf("%d/tcp", port)
+
+		out, _ := exec.Command("netsh", "advfirewall", "firewall", "show", "rule",
+			fmt.Sprintf("name=%s", ruleName),
+		).Output()
+		if strings.Contains(string(out), ruleName) {
+			logger.Infof("Windows firewall port %d already open", port)
+			cfg.AddFirewallPort(port)
+			return
+		}
+
+		psCmd := fmt.Sprintf(
+			`Start-Process netsh -ArgumentList 'advfirewall firewall add rule name="%s" dir=in action=allow protocol=TCP localport=%s' -Verb RunAs -Wait`,
+			ruleName, rule,
+		)
+		if err := exec.Command("powershell", "-Command", psCmd).Run(); err != nil {
+			logger.Warnf("Failed to open Windows firewall port %d: %v", port, err)
+			return
+		}
+		logger.Infof("Windows firewall: port %d opened", port)
+		cfg.AddFirewallPort(port)
 	}
 }
 
@@ -92,6 +159,7 @@ type UnavailablePrinter struct {
 type Status struct {
 	ServerRunning       bool                 `json:"serverRunning"`
 	DefaultIp           string               `json:"defaultIp"`
+	NetworkIp           string               `json:"networkIp"`
 	ErrorMsg            string               `json:"errorMsg"`
 	Printers            []Printer            `json:"printers"`
 	UnavailablePrinters []UnavailablePrinter `json:"unavailablePrinters"`
@@ -102,6 +170,21 @@ func (a *App) GetPrinterIp(id string) string {
 	ip := fmt.Sprintf("127.0.0.1:%d/p/%s", a.webserver.Port, id)
 	logger.Debugf("Generated printer endpoint: %s", ip)
 	return ip
+}
+
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, address := range addrs {
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return ""
 }
 
 func (a *App) Status() Status {
@@ -156,6 +239,7 @@ func (a *App) Status() Status {
 	return Status{
 		ServerRunning:       a.webserver.Running(),
 		DefaultIp:           fmt.Sprintf("127.0.0.1:%d", a.webserver.Port),
+		NetworkIp:           fmt.Sprintf("%s:%d", getLocalIP(), a.webserver.Port),
 		Printers:            printers,
 		UnavailablePrinters: unavailablePrinters,
 		ErrorMsg:            errorMsg,
@@ -267,5 +351,28 @@ func (a *App) DisableAutostart() error {
 		return a.autoStart.Disable()
 	}
 
+	return nil
+}
+
+func (a *App) OpenKiosk(url string) error {
+	logger.Infof("Opening kiosk with URL: %s", url)
+
+	wailsruntime.MenuSetApplicationMenu(a.ctx, nil)
+
+	// Navigate to the URL via event to frontend
+	wailsruntime.EventsEmit(a.ctx, "kiosk_open", url)
+
+	logger.Infof("Kiosk mode activated for URL: %s", url)
+	return nil
+}
+
+func (a *App) CloseKiosk() error {
+	logger.Infof("Closing kiosk mode")
+
+	wailsruntime.EventsEmit(a.ctx, "kiosk_close")
+
+	wailsruntime.MenuSetApplicationMenu(a.ctx, createMenu(a))
+
+	logger.Infof("Kiosk mode closed, returned to normal mode")
 	return nil
 }
