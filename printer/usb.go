@@ -61,6 +61,7 @@ func ListUSBPrinters() (*Printers, error) {
 			result.Available = append(result.Available, Info{
 				Id:   id,
 				Name: info.Name,
+				Type: getPrinterType(info.VidPid),
 			})
 		}
 	}

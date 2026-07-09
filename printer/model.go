@@ -53,9 +53,17 @@ type Printer struct {
 	jobs    chan Job
 }
 
+type PrinterType string
+
+const (
+	PrinterTypeReceipt PrinterType = "receipt"
+	PrinterTypeLabel   PrinterType = "label"
+)
+
 type Info struct {
 	Id   string
 	Name string
+	Type PrinterType
 }
 
 type UnavailableInfo struct {
