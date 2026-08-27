@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 var ErrNoAvailablePort = errors.New("no available port in range")
@@ -20,19 +23,47 @@ const (
 	PortRangeEnd   = 4555
 )
 
+// MaxWebViewURLLength caps the kiosk URL length to something sane.
+const MaxWebViewURLLength = 2048
+
 type AppConfig struct {
-	Port           int      `json:"port"`
-	LANPrinters    []string `json:"lan_printers,omitempty"`
-	WebViewURL     string   `json:"webview_url,omitempty"`
-	WebViewPIN     string   `json:"webview_pin,omitempty"`
-	WebViewEnabled bool     `json:"webview_enabled"`
+	Port        int      `json:"port"`
+	LANPrinters []string `json:"lan_printers,omitempty"`
+	WebViewURL  string   `json:"webview_url,omitempty"`
+	// WebViewPIN is a legacy plaintext field. Only ever read during
+	// migration in Load(); new PINs are always written to WebViewPINHash.
+	WebViewPIN     string `json:"webview_pin,omitempty"`
+	WebViewPINHash string `json:"webview_pin_hash,omitempty"`
+	WebViewEnabled bool   `json:"webview_enabled"`
 }
 
 func defaults() AppConfig {
 	return AppConfig{
-		Port:       0,
-		WebViewPIN: "1234",
+		Port: 0,
 	}
+}
+
+// ValidateWebViewURL enforces that url is a well-formed http(s) URL with a
+// non-empty host and a sane length. Shared by the Wails-bound desktop path
+// and the HTTP kiosk API so both entry points apply identical rules.
+func ValidateWebViewURL(raw string) error {
+	if raw == "" {
+		return errors.New("URL cannot be empty")
+	}
+	if len(raw) > MaxWebViewURLLength {
+		return fmt.Errorf("URL is too long (max %d characters)", MaxWebViewURLLength)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("URL must use http or https")
+	}
+	if u.Host == "" {
+		return errors.New("URL must include a host")
+	}
+	return nil
 }
 
 type Manager struct {
@@ -73,6 +104,21 @@ func (cm *Manager) Load() error {
 	if err := json.Unmarshal(data, &cm.Data); err != nil {
 		return fmt.Errorf("config parse error: %w", err)
 	}
+
+	// One-time migration: legacy installs stored the PIN in plaintext.
+	// Hash it, drop the plaintext, and persist the migration.
+	if cm.Data.WebViewPIN != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(cm.Data.WebViewPIN), bcrypt.DefaultCost)
+		if err != nil {
+			return fmt.Errorf("PIN migration failed: %w", err)
+		}
+		cm.Data.WebViewPINHash = string(hash)
+		cm.Data.WebViewPIN = ""
+		if err := cm.saveLocked(); err != nil {
+			return fmt.Errorf("PIN migration save failed: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -178,19 +224,38 @@ func (cm *Manager) GetWebViewEnabled() bool {
 func (cm *Manager) HasWebViewPIN() bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	return cm.Data.WebViewPIN != ""
+	return cm.Data.WebViewPINHash != ""
 }
 
 // SetWebViewURL validates and persists the kiosk URL.
-func (cm *Manager) SetWebViewURL(url string) error {
+func (cm *Manager) SetWebViewURL(rawURL string) error {
+	if err := ValidateWebViewURL(rawURL); err != nil {
+		return err
+	}
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	cm.Data.WebViewURL = url
+	cm.Data.WebViewURL = rawURL
 	return cm.saveLocked()
 }
 
-// SetWebViewPIN validates (exactly 4 digits) and persists the plaintext PIN.
+// SetWebViewPIN validates (exactly 4 digits) and persists the PIN as a
+// bcrypt hash. The plaintext value is never stored.
 func (cm *Manager) SetWebViewPIN(pin string) error {
+	if err := validatePINFormat(pin); err != nil {
+		return err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(pin), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash PIN: %w", err)
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.Data.WebViewPINHash = string(hash)
+	return cm.saveLocked()
+}
+
+// validatePINFormat enforces the 4-digit numeric PIN rule.
+func validatePINFormat(pin string) error {
 	if len(pin) != 4 {
 		return errors.New("PIN must be exactly 4 digits")
 	}
@@ -199,17 +264,20 @@ func (cm *Manager) SetWebViewPIN(pin string) error {
 			return errors.New("PIN must contain digits only")
 		}
 	}
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.Data.WebViewPIN = pin
-	return cm.saveLocked()
+	return nil
 }
 
-// CheckWebViewPIN returns true when raw matches the stored PIN.
+// CheckWebViewPIN returns true when raw matches the stored PIN hash.
+// Returns false (never an error) when no PIN has been configured yet.
 func (cm *Manager) CheckWebViewPIN(raw string) bool {
 	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	return cm.Data.WebViewPIN != "" && cm.Data.WebViewPIN == raw
+	hash := cm.Data.WebViewPINHash
+	cm.mu.RUnlock()
+
+	if hash == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(raw)) == nil
 }
 
 // SetWebViewEnabled persists the enabled flag.

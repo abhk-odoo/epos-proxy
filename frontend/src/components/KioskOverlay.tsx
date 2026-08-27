@@ -48,7 +48,6 @@ export default function KioskOverlay() {
   const handlePINSuccess = async () => {
     setPinVisible(false);
     await actions.toggleEnabled(false);
-    await actions.exitKiosk();
   };
 
   const handlePINDismiss = () => {
@@ -81,10 +80,11 @@ export default function KioskOverlay() {
         style={{ zIndex: 9990, pointerEvents: pinVisible ? "none" : "auto" }}
       >
         <iframe
+          key={data.reloadNonce}
           src={data.config.url}
           title="Kiosk"
           className="w-full h-full border-0"
-          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
         />
       </div>
 

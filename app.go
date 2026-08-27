@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"runtime"
 	"time"
 
 	"epos-proxy/internal/config"
+	"epos-proxy/internal/kiosk"
 	"epos-proxy/internal/logger"
 	"epos-proxy/internal/printer"
 	"epos-proxy/internal/server"
@@ -46,6 +48,10 @@ type App struct {
 	autoStart      *autostart.App
 	dialogs        dialoger
 	appMenu        *menu.Menu // stored so kiosk mode can hide/restore the menu bar
+	// mobileAssets serves the mobile kiosk-management UI (/kiosk) over
+	// HTTP. Same embed.FS as the desktop Wails asset server (main.go),
+	// rooted at frontend/dist.
+	mobileAssets fs.FS
 }
 
 // dlg returns the dialog backend, defaulting to the Wails runtime so an App
@@ -140,7 +146,23 @@ func (a *App) startup(ctx context.Context) {
 		logger.Warn("Unable to resolve port, using default")
 	}
 
-	a.webserver = server.New(port, a.printerManager)
+	mobileAssets := a.mobileAssets
+	if mobileAssets != nil {
+		sub, err := fs.Sub(mobileAssets, "frontend/dist")
+		if err != nil {
+			logger.Errorf("Failed to prepare mobile UI assets: %v", err)
+			mobileAssets = nil
+		} else {
+			mobileAssets = sub
+		}
+	}
+
+	a.webserver = server.New(port, a.printerManager, a.config, mobileAssets)
+	a.webserver.SetKioskCallbacks(&server.KioskCallbacks{
+		Open:   a.kioskOpen,
+		Close:  a.kioskClose,
+		Reload: a.kioskReload,
+	})
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -149,6 +171,41 @@ func (a *App) shutdown(ctx context.Context) {
 	if err := a.webserver.Stop(); err != nil {
 		logger.Errorf("Server stop error: %v", err)
 	}
+}
+
+// kioskOpen enables kiosk mode and enters fullscreen. Used both by the
+// desktop toggle and the /api/kiosk/open route driven from the mobile UI.
+func (a *App) kioskOpen() error {
+	if err := a.config.SetWebViewEnabled(true); err != nil {
+		return err
+	}
+	a.SetWindowFullscreen(true)
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "kiosk:state-changed")
+	}
+	return nil
+}
+
+// kioskClose disables kiosk mode and exits fullscreen. Used both by the
+// desktop toggle and the /api/kiosk/close route driven from the mobile UI.
+func (a *App) kioskClose() error {
+	if err := a.config.SetWebViewEnabled(false); err != nil {
+		return err
+	}
+	a.SetWindowFullscreen(false)
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "kiosk:state-changed")
+	}
+	return nil
+}
+
+// kioskReload asks the desktop kiosk overlay (if active) to reload its
+// iframe. Used by the /api/kiosk/reload route driven from the mobile UI.
+func (a *App) kioskReload() error {
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "kiosk:reload")
+	}
+	return nil
 }
 
 func (a *App) AppVariable() AppVariable {
@@ -278,6 +335,47 @@ func (a *App) ValidateWebViewPIN(pin string) bool {
 func (a *App) SetWebViewEnabled(v bool) error {
 	logger.Debugf("Setting WebView enabled: %v", v)
 	return a.config.SetWebViewEnabled(v)
+}
+
+// RemoteKioskInfo is what the desktop "Remote Kiosk Management" section
+// needs to render: the list of LAN IPs to choose from, the mobile URL for
+// the selected one, and a QR code encoding that same URL.
+type RemoteKioskInfo struct {
+	LANIPs    []string `json:"lanIPs"`
+	MobileURL string   `json:"mobileURL"`
+	QRDataURI string   `json:"qrDataURI"`
+}
+
+// GetRemoteKioskInfo returns the mobile kiosk-management URL and a QR code
+// for it, for the given LAN IP. If ip is empty, the first detected
+// non-loopback IPv4 address is used. The QR always encodes exactly
+// http://<ip>:<port>/kiosk — no pairing code, token, or PIN.
+func (a *App) GetRemoteKioskInfo(ip string) (RemoteKioskInfo, error) {
+	ips, err := kiosk.LocalIPv4Addresses()
+	if err != nil {
+		return RemoteKioskInfo{}, fmt.Errorf("failed to list LAN addresses: %w", err)
+	}
+
+	selected := ip
+	if selected == "" && len(ips) > 0 {
+		selected = ips[0]
+	}
+
+	info := RemoteKioskInfo{LANIPs: ips}
+	if selected == "" {
+		// No LAN interface available (e.g. offline machine) — nothing to
+		// show, but not an error.
+		return info, nil
+	}
+
+	info.MobileURL = kiosk.MobileKioskURL(selected, a.webserver.Port)
+	qr, err := kiosk.GenerateQRDataURI(info.MobileURL)
+	if err != nil {
+		return RemoteKioskInfo{}, fmt.Errorf("failed to generate QR code: %w", err)
+	}
+	info.QRDataURI = qr
+
+	return info, nil
 }
 
 // SetWindowFullscreen puts the main Wails window into or out of fullscreen

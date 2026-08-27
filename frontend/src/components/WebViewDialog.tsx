@@ -1,6 +1,7 @@
 import { useContext, useEffect, useState } from "react";
 import { WebViewContext } from "../contexts/WebViewContext";
 import Dialog from "./Dialog";
+import RemoteKioskSection from "./RemoteKioskSection";
 
 export default function WebViewDialog() {
   const { data, actions } = useContext(WebViewContext);
@@ -182,6 +183,8 @@ export default function WebViewDialog() {
         <p className="text-xs text-gray-400 -mt-2">
           Hidden unlock gesture: tap any screen edge 4× quickly, then enter your PIN.
         </p>
+
+        <RemoteKioskSection />
       </div>
     </Dialog>
   );

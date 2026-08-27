@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -230,41 +231,106 @@ func TestFindAvailablePort_RangeExhausted(t *testing.T) {
 	testutil.ExpectedEqual(t, result, 0)
 }
 
-// func TestWebViewConfig(t *testing.T) {
-// 	tempDir := t.TempDir()
-// 	cm := &Manager{
-// 		path: filepath.Join(tempDir, "config.json"),
-// 		Data: defaults(),
-// 	}
+func TestWebViewConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	cm := &Manager{
+		path: filepath.Join(tempDir, "config.json"),
+		Data: defaults(),
+	}
 
-// 	testutil.ExpectedEqual(t, cm.GetWebViewEnabled(), false)
-// 	testutil.ExpectedEqual(t, cm.GetWebViewURL(), "")
-// 	testutil.ExpectedEqual(t, cm.HasWebViewPIN(), true) // default is "1234"
-// 	testutil.ExpectedTrue(t, cm.CheckWebViewPIN("1234"))
-// 	testutil.ExpectedFalse(t, cm.CheckWebViewPIN("0000"))
+	testutil.ExpectedEqual(t, cm.GetWebViewEnabled(), false)
+	testutil.ExpectedEqual(t, cm.GetWebViewURL(), "")
+	testutil.ExpectedEqual(t, cm.HasWebViewPIN(), false) // no default PIN anymore
+	testutil.ExpectedFalse(t, cm.CheckWebViewPIN("1234"))
+	testutil.ExpectedFalse(t, cm.CheckWebViewPIN(""))
 
-// 	// Test URL
-// 	err := cm.SetWebViewURL("https://example.com/pos")
-// 	testutil.ExpectedNoError(t, err)
-// 	testutil.ExpectedEqual(t, cm.GetWebViewURL(), "https://example.com/pos")
+	// Test URL
+	err := cm.SetWebViewURL("https://example.com/pos")
+	testutil.ExpectedNoError(t, err)
+	testutil.ExpectedEqual(t, cm.GetWebViewURL(), "https://example.com/pos")
 
-// 	// Test Enabled
-// 	err = cm.SetWebViewEnabled(true)
-// 	testutil.ExpectedNoError(t, err)
-// 	testutil.ExpectedEqual(t, cm.GetWebViewEnabled(), true)
+	// Invalid URLs are rejected
+	testutil.ExpectedError(t, cm.SetWebViewURL(""))
+	testutil.ExpectedError(t, cm.SetWebViewURL("ftp://example.com"))
+	testutil.ExpectedError(t, cm.SetWebViewURL("not a url"))
+	testutil.ExpectedError(t, cm.SetWebViewURL("javascript:alert(1)"))
+	testutil.ExpectedError(t, cm.SetWebViewURL("http://"))
 
-// 	// Test PIN validation
-// 	err = cm.SetWebViewPIN("123") // too short
-// 	testutil.ExpectedError(t, err)
+	// Test Enabled
+	err = cm.SetWebViewEnabled(true)
+	testutil.ExpectedNoError(t, err)
+	testutil.ExpectedEqual(t, cm.GetWebViewEnabled(), true)
 
-// 	err = cm.SetWebViewPIN("12345") // too long
-// 	testutil.ExpectedError(t, err)
+	// Test PIN validation
+	err = cm.SetWebViewPIN("123") // too short
+	testutil.ExpectedError(t, err)
 
-// 	err = cm.SetWebViewPIN("12a4") // non-digit
-// 	testutil.ExpectedError(t, err)
+	err = cm.SetWebViewPIN("12345") // too long
+	testutil.ExpectedError(t, err)
 
-// 	err = cm.SetWebViewPIN("9876") // valid
-// 	testutil.ExpectedNoError(t, err)
-// 	testutil.ExpectedTrue(t, cm.CheckWebViewPIN("9876"))
-// 	testutil.ExpectedFalse(t, cm.CheckWebViewPIN("1234"))
-// }
+	err = cm.SetWebViewPIN("12a4") // non-digit
+	testutil.ExpectedError(t, err)
+
+	err = cm.SetWebViewPIN("9876") // valid
+	testutil.ExpectedNoError(t, err)
+	testutil.ExpectedTrue(t, cm.HasWebViewPIN())
+	testutil.ExpectedTrue(t, cm.CheckWebViewPIN("9876"))
+	testutil.ExpectedFalse(t, cm.CheckWebViewPIN("1234"))
+
+	// The PIN must never be stored in plaintext on disk.
+	raw, err := os.ReadFile(cm.path)
+	testutil.ExpectedNoError(t, err)
+	testutil.ExpectedFalse(t, strings.Contains(string(raw), "9876"))
+	testutil.ExpectedContains(t, string(raw), "webview_pin_hash")
+}
+
+func TestWebViewPIN_LegacyPlaintextMigration(t *testing.T) {
+	tempDir := t.TempDir()
+	configFile := filepath.Join(tempDir, "config.json")
+
+	// Simulate a legacy config file with a plaintext PIN.
+	legacy := AppConfig{WebViewPIN: "4321"}
+	raw, err := json.Marshal(legacy)
+	testutil.ExpectedNoError(t, err)
+	err = os.WriteFile(configFile, raw, 0644)
+	testutil.ExpectedNoError(t, err)
+
+	cm := &Manager{path: configFile, Data: defaults()}
+	err = cm.Load()
+	testutil.ExpectedNoError(t, err)
+
+	// Plaintext should be migrated to a hash and cleared.
+	testutil.ExpectedEqual(t, cm.Data.WebViewPIN, "")
+	testutil.ExpectedTrue(t, cm.Data.WebViewPINHash != "")
+	testutil.ExpectedTrue(t, cm.HasWebViewPIN())
+	testutil.ExpectedTrue(t, cm.CheckWebViewPIN("4321"))
+
+	// Migration must be persisted to disk.
+	onDisk, err := os.ReadFile(configFile)
+	testutil.ExpectedNoError(t, err)
+	testutil.ExpectedFalse(t, strings.Contains(string(onDisk), "4321"))
+	testutil.ExpectedContains(t, string(onDisk), "webview_pin_hash")
+}
+
+func TestValidateWebViewURL(t *testing.T) {
+	valid := []string{
+		"http://example.com",
+		"https://example.com/pos/ui",
+		"http://192.168.1.50:8069/pos",
+	}
+	for _, u := range valid {
+		testutil.ExpectedNoError(t, ValidateWebViewURL(u), fmt.Sprintf("expected %q to be valid", u))
+	}
+
+	invalid := []string{
+		"",
+		"ftp://example.com",
+		"javascript:alert(1)",
+		"not a url",
+		"http://",
+		"data:text/html,<script>1</script>",
+	}
+	for _, u := range invalid {
+		testutil.ExpectedError(t, ValidateWebViewURL(u), fmt.Sprintf("expected %q to be invalid", u))
+	}
+}

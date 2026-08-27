@@ -58,7 +58,7 @@ func TestApp_AppVariableAndPrintersAndGetPrinterIp(t *testing.T) {
 
 	port := testutil.GetFreePort(t)
 	mgr := printer.NewManager()
-	srv := server.New(port, mgr)
+	srv := server.New(port, mgr, cfg, nil)
 	defer srv.Stop()
 
 	app := &App{
@@ -299,11 +299,11 @@ func TestApp_WebViewMethods(t *testing.T) {
 		config: cfg,
 	}
 
-	// Initial config check
+	// Initial config check — no default PIN anymore
 	wvCfg := app.GetWebViewConfig()
 	testutil.ExpectedEqual(t, wvCfg.Enabled, false)
 	testutil.ExpectedEqual(t, wvCfg.URL, "")
-	testutil.ExpectedEqual(t, wvCfg.HasPIN, true)
+	testutil.ExpectedEqual(t, wvCfg.HasPIN, false)
 
 	// Set URL
 	err = app.SetWebViewURL("http://localhost:8069/pos/ui")
@@ -328,4 +328,37 @@ func TestApp_WebViewMethods(t *testing.T) {
 
 	// SetWindowFullscreen should not panic even without live Wails context
 	app.SetWindowFullscreen(false)
+}
+
+func TestApp_GetRemoteKioskInfo(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("HOME", tempDir)
+
+	cfg, err := config.NewManager()
+	testutil.ExpectedNoError(t, err)
+
+	port := testutil.GetFreePort(t)
+	mgr := printer.NewManager()
+	srv := server.New(port, mgr, cfg, nil)
+	defer srv.Stop()
+
+	app := &App{config: cfg, webserver: srv}
+
+	info, err := app.GetRemoteKioskInfo("")
+	testutil.ExpectedNoError(t, err)
+
+	if len(info.LANIPs) == 0 {
+		// No LAN interface on this machine/CI runner — nothing more to
+		// assert, but the call itself must not error.
+		return
+	}
+
+	testutil.ExpectedTrue(t, info.MobileURL != "", "expected a mobile URL when LAN IPs are present")
+	testutil.ExpectedContains(t, info.MobileURL, fmt.Sprintf(":%d/kiosk", port))
+	testutil.ExpectedContains(t, info.QRDataURI, "data:image/png;base64,")
+
+	// Explicit IP selection is honored.
+	explicit, err := app.GetRemoteKioskInfo(info.LANIPs[0])
+	testutil.ExpectedNoError(t, err)
+	testutil.ExpectedEqual(t, explicit.MobileURL, info.MobileURL)
 }

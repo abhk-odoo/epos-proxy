@@ -4,8 +4,11 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io/fs"
+	"sync"
 	"sync/atomic"
 
+	"epos-proxy/internal/config"
 	"epos-proxy/internal/escpos"
 	"epos-proxy/internal/logger"
 	"epos-proxy/internal/printer"
@@ -25,9 +28,23 @@ type Server struct {
 	app     *fiber.App
 	Port    int
 	running atomic.Bool
+
+	kioskMu        sync.RWMutex
+	kioskCallbacks *KioskCallbacks
 }
 
-func New(port int, mgr *printer.Manager) *Server {
+// KioskCallbacks lets HTTP handlers (driven by the mobile /kiosk UI) act on
+// the live desktop window. Registered once by App via SetKioskCallbacks.
+type KioskCallbacks struct {
+	// Open enters kiosk/fullscreen mode on the desktop window.
+	Open func() error
+	// Close exits kiosk/fullscreen mode on the desktop window.
+	Close func() error
+	// Reload asks the desktop kiosk overlay to reload the current URL.
+	Reload func() error
+}
+
+func New(port int, mgr *printer.Manager, cfg *config.Manager, mobileAssets fs.FS) *Server {
 	app := fiber.New(fiber.Config{
 		AppName: "ePOS proxy",
 	})
@@ -54,6 +71,10 @@ func New(port int, mgr *printer.Manager) *Server {
 	})
 
 	server := &Server{app: app, Port: port}
+
+	registerKioskRoutes(app, cfg, server)
+	registerKioskMobileUI(app, mobileAssets)
+
 	server.running.Store(true)
 	go func() {
 		logger.Infof("HTTP server listening on 0.0.0.0:%d", port)
@@ -140,4 +161,19 @@ func (s *Server) Stop() error {
 
 func (s *Server) Running() bool {
 	return s.running.Load()
+}
+
+// SetKioskCallbacks registers the callbacks used by the /api/kiosk/* routes
+// to drive the live desktop window. Safe to call after New(); handlers read
+// the current value on each request.
+func (s *Server) SetKioskCallbacks(cb *KioskCallbacks) {
+	s.kioskMu.Lock()
+	defer s.kioskMu.Unlock()
+	s.kioskCallbacks = cb
+}
+
+func (s *Server) callbacks() *KioskCallbacks {
+	s.kioskMu.RLock()
+	defer s.kioskMu.RUnlock()
+	return s.kioskCallbacks
 }
